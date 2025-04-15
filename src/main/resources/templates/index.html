@@ -3,220 +3,368 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Synthetic Market Monitor</title>
+    <title>AAPL Market Monitor (ApexCharts)</title>
 
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
           rel="stylesheet"
           integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
           crossorigin="anonymous">
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+
     <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js" integrity="sha512-iKDtgDyTHjAitUDdLljGhenhPwrbBfqTKWO1mkhSFH3A7blITC9MhYon6SjnMhp4o0rADGw9yAC6EW4t5a4K3g==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"
+            integrity="sha512-iKDtgDyTHjAitUDdLljGhenhPwrbBfqTKWO1mkhSFH3A7blITC9MhYon6SjnMhp4o0rADGw9yAC6EW4t5a4K3g=="
+            crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
     <style>
-        /* Optional: Give the chart container a max height */
         #chartContainer {
-            position: relative;
-            height: 60vh; /* Adjust height as needed */
+            height: 75vh; /* Adjust height */
             width: 100%;
+        }
+        body { padding-top: 56px; } /* Prevent navbar overlap */
+        #connectionStatus { transition: color 0.5s ease; }
+        /* Optional: Style ApexCharts Tooltips if needed */
+        .apexcharts-tooltip {
+            background: #f3f3f3;
+            color: #333;
         }
     </style>
 </head>
 <body>
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark fixed-top">
     <div class="container-fluid">
-        <a class="navbar-brand" href="#">Market Monitor</a>
-        <span class="navbar-text ms-auto" id="connectionStatus" style="color: orange;">
-                Connecting...
-            </span>
+        <a class="navbar-brand" href="#">AAPL Monitor</a>
+        <span class="navbar-text ms-auto" id="connectionStatus" style="color: orange;">Initializing...</span>
     </div>
 </nav>
 
-<div class="container mt-4">
-    <h1 id="chartTitle">Market Data (Waiting for connection...)</h1>
-    <div id="chartContainer">
-        <canvas id="marketChart"></canvas>
-    </div>
+<div class="container-fluid mt-3">
+    <div id="chartContainer"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
         integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
         crossorigin="anonymous"></script>
 
-<script>
-    const ctx = document.getElementById('marketChart').getContext('2d');
-    const connectionStatusEl = document.getElementById('connectionStatus');
-    const chartTitleEl = document.getElementById('chartTitle');
-    const MAX_DATA_POINTS = 50; // Keep only the latest 50 points
+<script type="text/javascript">
+    document.addEventListener('DOMContentLoaded', function () {
 
-    // --- Chart.js Configuration ---
-    const chartConfig = {
-        type: 'line',
-        data: {
-            labels: [], // x-axis labels (timestamps)
-            datasets: [{
-                label: 'Market Value', // Set dynamically later
-                data: [],           // y-axis data points (currentValue)
-                borderColor: 'rgb(75, 192, 192)',
-                tension: 0.1,       // Makes the line slightly curved
-                fill: false
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false, // Important for custom container height
-            scales: {
-                x: {
-                    title: {
-                        display: true,
-                        text: 'Time' // Updated axis title
+        const SYMBOL = "AAPL";
+        const CHART_INTERVAL_MINUTES = 1;
+        const INTERVAL_STRING = `${CHART_INTERVAL_MINUTES} minute${CHART_INTERVAL_MINUTES > 1 ? 's' : ''}`;
+        const INTERVAL_MILLIS = CHART_INTERVAL_MINUTES * 60 * 1000;
+        const HISTORY_DURATION_HOURS = 4;
+
+        const connectionStatusEl = document.getElementById('connectionStatus');
+        const chartContainer = document.getElementById('chartContainer');
+        let chart = null;
+        let stompClient = null;
+        let ohlcDataArray = [];
+        let currentPartialCandle = null;
+        let lastCompletedBucketTimeMillis = null;
+        function floorTimestampToIntervalMillis(timestampMillis, intervalMillis) {
+            if (typeof timestampMillis !== 'number' || isNaN(timestampMillis)) {
+                console.error("Invalid timestamp received in floorTimestampToIntervalMillis:", timestampMillis);
+                return null;
+            }
+            return Math.floor(timestampMillis / intervalMillis) * intervalMillis;
+        }
+
+        // --- Initialize Chart ---
+        function initializeChart() {
+            if (typeof ApexCharts === 'undefined') {
+                console.error("ApexCharts library is not loaded!");
+                connectionStatusEl.textContent = 'Error: Chart Library missing!';
+                connectionStatusEl.style.color = 'red';
+                return;
+            }
+            if (!chartContainer) {
+                console.error("Chart container element not found!");
+                connectionStatusEl.textContent = 'Error: Chart container missing!';
+                connectionStatusEl.style.color = 'red';
+                return;
+            }
+
+            const options = {
+                series: [{
+                    name: 'Candlestick',
+                    data: []
+                }],
+                chart: {
+                    type: 'candlestick',
+                    height: '100%',
+                    animations: {
+                        enabled: true,
+                        easing: 'linear',
+                        dynamicAnimation: {
+                            enabled: true,
+                            speed: 350
+                        }
                     }
-                    // Consider adding time scale type if needed:
-                    // type: 'time',
-                    // time: {
-                    //     unit: 'second', // Adjust display unit
-                    //     displayFormats: {
-                    //         second: 'HH:mm:ss'
-                    //     }
-                    // }
                 },
-                y: {
-                    title: {
-                        display: true,
-                        text: 'Value'
+                title: {
+                    text: `${SYMBOL} Candlestick Chart (${INTERVAL_STRING})`,
+                    align: 'left'
+                },
+                xaxis: {
+                    type: 'datetime',
+                    labels: {
+                        datetimeUTC: false,
+                        format: 'HH:mm:ss'
+                    }
+                },
+                yaxis: {
+                    tooltip: {
+                        enabled: true
                     },
-                    // beginAtZero: true // Optional: start y-axis at zero
+                    labels: {
+                        formatter: function (val) {
+                            return "$" + val.toFixed(2);
+                        }
+                    }
+                },
+                tooltip: {
+                    shared: true,
+                    custom: function({ series, seriesIndex, dataPointIndex, w }) {
+                        const o = series[seriesIndex][dataPointIndex][0];
+                        const h = series[seriesIndex][dataPointIndex][1];
+                        const l = series[seriesIndex][dataPointIndex][2];
+                        const c = series[seriesIndex][dataPointIndex][3];
+                        // Get timestamp from config - Apex stores it differently internally
+                        const timestamp = w.globals.seriesX[seriesIndex][dataPointIndex];
+                        const d = new Date(timestamp);
+                        const timeFormat = d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit'});
+
+                        return `<div class="apexcharts-tooltip-candlestick">
+                                     <div>Time: <strong>${timeFormat}</strong></div>
+                                     <div>Open: <strong>$${o.toFixed(2)}</strong></div>
+                                     <div>High: <strong>$${h.toFixed(2)}</strong></div>
+                                     <div>Low: <strong>$${l.toFixed(2)}</strong></div>
+                                     <div>Close: <strong>$${c.toFixed(2)}</strong></div>
+                                 </div>`;
+                    }
                 }
-            },
-            animation: {
-                duration: 200 // Smoother updates
+            };
+
+            try {
+                chart = new ApexCharts(chartContainer, options);
+                chart.render();
+                console.log("ApexCharts Initialized.");
+                connectionStatusEl.textContent = 'Chart Initialized. Fetching history...';
+                connectionStatusEl.style.color = 'orange';
+            } catch(error) {
+                console.error("Error initializing ApexCharts:", error);
+                connectionStatusEl.textContent = `Error: Chart init failed (${error.message})`;
+                connectionStatusEl.style.color = 'red';
+            }
+
+        }
+
+
+        // --- Fetch Initial Historical Data ---
+        function fetchInitialData() {
+            if (!chart) {
+                console.error("Cannot fetch data: Chart not initialized.");
+                connectionStatusEl.textContent = 'Error: Chart Init Failed';
+                connectionStatusEl.style.color = 'red';
+                return;
+            }
+
+            const endTime = new Date();
+            const startTime = new Date(endTime.getTime() - HISTORY_DURATION_HOURS * 60 * 60 * 1000);
+            const endTimeISO = endTime.toISOString();
+            const startTimeISO = startTime.toISOString();
+            const apiUrl = `/api/stocks/${SYMBOL}/ohlc?interval=${encodeURIComponent(INTERVAL_STRING)}&startTime=${startTimeISO}&endTime=${endTimeISO}`;
+
+            console.log("Fetching historical data from:", apiUrl);
+            connectionStatusEl.textContent = 'Fetching history...';
+            connectionStatusEl.style.color = 'orange';
+
+            fetch(apiUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        return response.text().then(text => {
+                            throw new Error(`HTTP error! status: ${response.status}, message: ${text || 'No error message body'}`);
+                        });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log(`Received ${data.length} historical OHLC buckets.`);
+                    ohlcDataArray = []; // Reset global array
+                    let maxTimeMillis = 0;
+
+                    if (!data) data = [];
+
+                    if (data.length === 0) {
+                        console.warn("No historical data received.");
+                        lastCompletedBucketTimeMillis = floorTimestampToIntervalMillis(Date.now(), INTERVAL_MILLIS);
+                    } else {
+                        data.forEach(item => {
+                            const candleTime = new Date(item.timeBucket);
+                            if (isNaN(candleTime.getTime())) {
+                                console.warn("Skipping data point with invalid timeBucket:", item.timeBucket);
+                                return;
+                            }
+                            const candleTimeMillis = candleTime.getTime();
+
+                            const o = Number(item.open);
+                            const h = Number(item.high);
+                            const l = Number(item.low);
+                            const c = Number(item.close);
+
+                            if (isNaN(o) || isNaN(h) || isNaN(l) || isNaN(c)) {
+                                console.warn("Skipping data point with invalid OHLC values:", item);
+                                return;
+                            }
+
+                            ohlcDataArray.push({ x: candleTime, y: [o, h, l, c] });
+
+                            if (candleTimeMillis > maxTimeMillis) {
+                                maxTimeMillis = candleTimeMillis;
+                            }
+                        });
+
+                        ohlcDataArray.sort((a, b) => a.x.getTime() - b.x.getTime());
+                        lastCompletedBucketTimeMillis = maxTimeMillis;
+                    }
+
+                    console.log(`Formatted data points: ${ohlcDataArray.length}. First point:`, ohlcDataArray[0]);
+                    console.log('Last completed bucket time (millis):', lastCompletedBucketTimeMillis);
+
+                    chart.updateSeries([{
+                        name: 'Candlestick',
+                        data: ohlcDataArray
+                    }], true);
+
+                    console.log("Historical data successfully set on chart series.");
+                    connectionStatusEl.textContent = 'History Loaded. Connecting WS...';
+                    connectStomp();
+
+                })
+                .catch(error => {
+                    console.error("Error fetching or processing historical data:", error);
+                    connectionStatusEl.textContent = `History Fetch Error: ${error.message}`;
+                    connectionStatusEl.style.color = 'red';
+                });
+        }
+
+        function connectStomp() {
+            if (stompClient && stompClient.connected) { return; }
+            if (stompClient && stompClient.connecting) { return; }
+            connectionStatusEl.textContent = 'Connecting WS...';
+            connectionStatusEl.style.color = 'orange';
+            try {
+                const socket = new SockJS('/websocket-endpoint');
+                stompClient = Stomp.over(socket);
+                stompClient.debug = null;
+                stompClient.connect({}, onConnectSuccess, onConnectError);
+            } catch (error) {
+                console.error("Error creating SockJS connection:", error);
+                connectionStatusEl.textContent = 'WS Init Error';
+                connectionStatusEl.style.color = 'red';
             }
         }
-    };
 
-    const marketChart = new Chart(ctx, chartConfig);
+        function onConnectSuccess(frame) {
+            console.log('STOMP Connected: ' + frame);
+            connectionStatusEl.textContent = 'Connected';
+            connectionStatusEl.style.color = 'lightgreen';
+            try {
+                stompClient.subscribe('/topic/synthetic-market-tick', onTickReceived, (error) => { /* ... error handling ... */
+                    console.error('STOMP Subscription error:', error);
+                    connectionStatusEl.textContent = 'WS Subscription Error';
+                    connectionStatusEl.style.color = 'red';
+                });
+                console.log("Subscribed to /topic/synthetic-market-tick");
+            } catch (subError) {
+                console.error('Error during STOMP subscription:', subError);
+                connectionStatusEl.textContent = 'WS Subscription Failed';
+                connectionStatusEl.style.color = 'red';
+            }
+        }
 
-    // --- WebSocket Connection (STOMP over SockJS) ---
-    const socket = new SockJS('/websocket-endpoint'); // Matches your Spring config
-    const stompClient = Stomp.over(socket);
+        function onConnectError(error) {
+            console.error('STOMP Connection Error: ' + error);
+            connectionStatusEl.textContent = 'WS Connection Error';
+            connectionStatusEl.style.color = 'red';
+            stompClient = null;
+        }
 
-    // Disable debug logging
-    stompClient.debug = null;
+        function onTickReceived(message) {
+            if (!chart) { return; }
 
-
-    const connectCallback = function (frame) {
-        console.log('STOMP Connected: ' + frame);
-        connectionStatusEl.textContent = 'Connected';
-        connectionStatusEl.style.color = 'lightgreen';
-
-        // Subscribe to the topic where market data is published
-        stompClient.subscribe('/topic/synthetic-market-tick', function (message) {
             try {
                 const tickData = JSON.parse(message.body);
-                // console.log("Received tick:", tickData); // For debugging
+                if (tickData.symbol !== SYMBOL) return;
 
-                updateChart(tickData);
+                const tickTimestamp = tickData.timestamp;
+                const tickPrice = Number(tickData.currentValue);
+
+                if (tickTimestamp === undefined || tickTimestamp === null || isNaN(tickPrice)) { return; }
+
+                const tickDate = new Date(tickTimestamp);
+                if (isNaN(tickDate.getTime())) { return; }
+                const tickTimestampMillis = tickDate.getTime();
+
+                if (lastCompletedBucketTimeMillis === null) {
+                    console.warn("lastCompletedBucketTimeMillis null, cannot process tick yet.");
+                    if (currentPartialCandle === null) {
+                        lastCompletedBucketTimeMillis = floorTimestampToIntervalMillis(tickTimestampMillis, INTERVAL_MILLIS) - INTERVAL_MILLIS;
+                        console.log("Setting fallback lastCompletedBucketTimeMillis to:", lastCompletedBucketTimeMillis);
+                    } else {
+                        return;
+                    }
+                }
+
+                const currentBucketStartTimeMillis = floorTimestampToIntervalMillis(tickTimestampMillis, INTERVAL_MILLIS);
+                if (currentBucketStartTimeMillis === null) return;
+
+                if (!currentPartialCandle) {
+                    if (currentBucketStartTimeMillis >= lastCompletedBucketTimeMillis) {
+                        currentPartialCandle = { x: new Date(currentBucketStartTimeMillis), y: [tickPrice, tickPrice, tickPrice, tickPrice] };
+                    } else { return; }
+                } else {
+                    const partialCandleStartTimeMillis = currentPartialCandle.x.getTime();
+
+                    if (currentBucketStartTimeMillis === partialCandleStartTimeMillis) {
+                        currentPartialCandle.y[1] = Math.max(currentPartialCandle.y[1], tickPrice); // High
+                        currentPartialCandle.y[2] = Math.min(currentPartialCandle.y[2], tickPrice); // Low
+                        currentPartialCandle.y[3] = tickPrice; // Close
+                    } else if (currentBucketStartTimeMillis > partialCandleStartTimeMillis) {
+                        // Finalize old candle, start new one
+                        ohlcDataArray.push(currentPartialCandle); // Add completed candle to array
+                        lastCompletedBucketTimeMillis = partialCandleStartTimeMillis;
+                        currentPartialCandle = { x: new Date(currentBucketStartTimeMillis), y: [tickPrice, tickPrice, tickPrice, tickPrice] };
+                    } else { return; }
+                }
+
+                if (currentPartialCandle) {
+                    const displayData = [...ohlcDataArray, currentPartialCandle];
+                    try {
+
+                        chart.updateSeries([{
+                            data: displayData
+                        }], false);
+                    } catch (updateError) {
+                        console.error("Error calling chart.updateSeries():", updateError);
+                        console.error("Data that caused error (last few points):", displayData.slice(-5));
+                    }
+                }
 
             } catch (e) {
-                console.error("Failed to parse message body or update chart:", e);
+                console.error("Failed to process tick message:", e);
                 console.error("Received body:", message.body);
             }
-        });
-    };
-
-    const errorCallback = function (error) {
-        console.error('STOMP Error: ' + error);
-        connectionStatusEl.textContent = 'Connection Error';
-        connectionStatusEl.style.color = 'red';
-        // Optional: Implement reconnection logic here
-        // setTimeout(connectStomp, 5000); // Try to reconnect after 5 seconds
-    };
-
-    function connectStomp() {
-        console.log("Attempting STOMP connection...");
-        connectionStatusEl.textContent = 'Connecting...';
-        connectionStatusEl.style.color = 'orange';
-        stompClient.connect(
-            {}, // Headers (e.g., for authentication if needed)
-            connectCallback,
-            errorCallback
-        );
-    }
-
-
-    // --- Chart Update Function ---
-    let isFirstMessage = true;
-
-    function updateChart(tickData) {
-        // **MODIFIED:** Expect 'timestamp' instead of 'date'
-        const { symbol, currentValue, timestamp } = tickData;
-
-        // **ADDED:** Basic check for timestamp existence
-        if (timestamp === undefined || timestamp === null) {
-            console.error("Received tick data is missing timestamp:", tickData);
-            return; // Don't process if timestamp is missing
         }
 
-        if (isFirstMessage) {
-            // Set title and dataset label on first message
-            const title = `Market Data for ${symbol || 'Unknown Symbol'}`;
-            chartTitleEl.textContent = title;
-            marketChart.data.datasets[0].label = `${symbol || 'Value'}`;
-            // Optionally update x-axis title here if needed, though already set in config
-            // marketChart.options.scales.x.title.text = 'Time';
-            isFirstMessage = false;
-        }
 
-        // --- Timestamp Processing ---
-        let label;
-        try {
-            // Create a Date object from the timestamp (handles ISO strings and epoch millis)
-            const dateObj = new Date(timestamp);
+        initializeChart();
+        fetchInitialData();
 
-            // **MODIFIED:** Format the timestamp for display on the x-axis label
-            // Example: HH:MM:SS. Use options to customize format
-            label = dateObj.toLocaleTimeString([], {
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit'
-                // hour12: false // Optional: use 24-hour format
-            });
-
-            // Optional: Add milliseconds for higher frequency display
-            // const milliseconds = dateObj.getMilliseconds().toString().padStart(3, '0');
-            // label = `${label}.${milliseconds}`;
-
-        } catch (e) {
-            console.error("Failed to parse timestamp:", timestamp, e);
-            label = "Invalid Time"; // Fallback label
-        }
-        // --- End Timestamp Processing ---
-
-        marketChart.data.labels.push(label);
-        marketChart.data.datasets[0].data.push(currentValue);
-
-        // Limit the number of data points shown
-        if (marketChart.data.labels.length > MAX_DATA_POINTS) {
-            marketChart.data.labels.shift(); // Remove oldest label
-            marketChart.data.datasets[0].data.shift(); // Remove oldest data point
-        }
-
-        marketChart.update(); // Redraw the chart
-    }
-
-    // --- Initial Connection Attempt ---
-    connectStomp();
-
-
-    // Optional: Handle STOMP connection closed event
-    stompClient.onWebSocketClose = () => {
-        console.log("WebSocket connection closed.");
-        connectionStatusEl.textContent = 'Disconnected';
-        connectionStatusEl.style.color = 'red';
-        // Optional: Try to reconnect
-        // setTimeout(connectStomp, 5000);
-    };
-
+    });
 </script>
 
 </body>
